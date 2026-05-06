@@ -1,0 +1,85 @@
+docker compose up -d 
+docker compose ps -- for checking health
+
+powershell 1 - create topics 
+
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --topic orders_raw --partitions 3 --replication-factor 1 --if-not-exists 
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --topic orders_clean --partitions 3 --replication-factor 1 --if-not-exists 
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --topic orders_quarantine --partitions 3 --replication-factor 1 --if-not-exists 
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --topic observability_events --partitions 3 --replication-factor 1 --if-not-exists 
+
+
+powershell 2 - start spark job before streaming data because it does not work on previous data only works on live data 
+
+docker exec spark-master /opt/spark/bin/spark-submit --master spark://spark-master:7077 --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.2 /opt/jobs/dq_stream_job.py 
+
+
+powershell 3 - insert live data 
+
+python orders_producer.py --rps 30 --duration 150 --null-rate 0.12 --dup-rate 0.12 --email-bad-rate 0.08
+
+powershell 4 -- soda install 
+
+docker exec spark-master pip install  soda-core-spark-df==3.5.5 
+docker exec spark-worker pip install  soda-core-spark-df==3.5.5 
+
+docker compose build obs-events-exporter 
+docker compose up -d obs-events-exporter prometheus grafana 
+
+docker compose down -v obs-events-exporter 
+docker compose down -v obs-events-exporter prometheus grafana 
+
+http://localhost:3000 for checking
+
+
+
+
+R-COMPL-001 — missing_percent(customer_id) < 5
+Every order must belong to a customer. This rule checks what percentage of records have no customer_id at all. We allow up to 5% as a soft tolerance — sometimes a guest checkout or a system event genuinely has no customer tied to it. But if 12% of your orders have no customer, something is broken upstream — either the producer isn't setting the field or a join is failing somewhere. In your run this was FAILING at 12.2%.
+
+R-COMPL-002 — missing_count(order_id) = 0
+An order with no order_id is essentially untrackable. You can't look it up, can't reconcile it, can't join it to any other table. Zero tolerance here — not even one record should have a null order_id. If this fires it almost always means a code bug in the producer or an upstream system sending malformed events.
+
+R-COMPL-003 — missing_count(amount) = 0
+Same logic as order_id. An order with no amount is financially meaningless — you can't bill it, report it, or audit it. Zero tolerance. If amount is null the record is fundamentally broken and shouldn't be trusted.
+
+R-COMPL-004 — missing_percent(email) < 5
+Email is used for customer communication — order confirmations, receipts, support. Some orders may come from API integrations or internal tools where email isn't available, so we allow up to 5% missing. Beyond that it suggests a systematic collection failure.
+
+R-COMPL-005 — missing_count(status) = 0
+Every order must have a lifecycle status — CREATED, CONFIRMED, SHIPPED etc. A null status means the order is in an unknown state. You can't process it, report on it, or display it correctly in any downstream system. Zero tolerance.
+
+UNIQUENESS RULES — "Are there any duplicates?"
+
+R-UNIQ-001 — duplicate_count(order_id) = 0
+Each order_id should appear exactly once in the stream. If the same order_id shows up twice it means either the producer sent it twice, a retry mechanism double-fired, or there's a fan-out bug somewhere. Downstream this causes double-billing, inflated revenue numbers, and broken order counts. Zero tolerance — every duplicate needs to be caught and quarantined. In your run this was FAILING with 30 duplicates measured by Soda.
+
+VALIDITY RULES — "Is the data in the right format and range?"
+
+R-VALID-001 — invalid_percent(email) < 1
+Checks that email addresses are properly formatted — must have an @ sign, a domain, and a valid TLD. We allow up to 1% invalid because some very old records or manual entries might have minor formatting issues. But 8% invalid means the email collection form or the upstream API is broken. In your run this was FAILING at 10.2%.
+
+R-VALID-002 — invalid_count(quantity) = 0, range 1–1000
+Quantity must be a whole number between 1 and 1000. A quantity of 0 means nothing was ordered — that record makes no sense. A negative quantity suggests a refund that was incorrectly routed to the orders stream instead of a returns stream. A quantity of 50,000 is almost certainly a data entry error. All of these should be caught before the record enters clean storage.
+
+R-VALID-003 — invalid_count(amount) = 0, min 0.01
+Amount must be at least 0.01 — meaning every order must have a positive monetary value. A zero or negative amount either means a free order slipped through incorrectly, a refund is in the wrong stream, or a calculation bug zeroed out the value. Any of these would corrupt revenue reporting.
+
+R-VALID-004 — invalid_count(currency) = 0
+Currency must be one of the known ISO codes you support — USD, EUR, GBP, JPY, INR, CAD, AUD, CHF, SGD. An unrecognised currency code means the record can't be converted, reported, or processed by your finance systems. If someone sends "DOLLARS" or "US" instead of "USD" that's invalid and needs to be caught here.
+
+R-VALID-005 — invalid_count(status) = 0
+Status must be one of the five defined values — CREATED, CONFIRMED, SHIPPED, DELIVERED, CANCELLED. If a new status like "PENDING" or "IN_TRANSIT" appears it means a developer added a new state without updating the contract. That rogue value would break any downstream system that does a status-based filter or enum mapping.
+
+VOLUME RULES — "Did any data actually arrive?"
+
+R-VOL-001 — row_count > 0
+The simplest possible check — is this batch empty? If a batch has zero records it usually means the Kafka topic went quiet, the producer crashed, or there's a consumer lag issue. This is your canary — if this fires, everything else is irrelevant because there's no data to check. In your run this shows 539 meaning the last batch had 539 records and the pipeline is alive.
+
+TIMELINESS RULES — "Is the data fresh?"
+
+R-TIME-001 — freshness(event_time) < 10 minutes
+Looks at the event_time field stamped on each order record and checks if the most recent one is within the last 10 minutes. If the newest record in a batch is older than 10 minutes it means data is stuck somewhere — either the producer is slow, Kafka has a growing backlog, or the events are being generated with wrong timestamps. For a real-time pipeline stale data is almost as bad as no data because any live dashboard or alert built on it will be showing the wrong picture.
+
+Quick reference — what fires in your run and why:
+RuleStatusWhyR-COMPL-001FAILING--null-rate 0.12 injected 12% null customer_idsR-UNIQ-001FAILING--dup-rate 0.12 injected 12% duplicate order_idsR-VALID-001FAILING--email-bad-rate 0.08 injected 8% malformed emailsAll other 10PASSINGYou didn't inject those specific problems
