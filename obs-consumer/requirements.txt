@@ -1,2 +1,0 @@
-kafka-python-ng==2.2.3
-prometheus-client==0.20.0
